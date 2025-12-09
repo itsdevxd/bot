@@ -1,15 +1,8 @@
+# bot.py
 import os
-import asyncio
 import logging
-
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    ChatAction,
-    MessageEntity,
-    ParseMode,
-)
+from telegram import Update, MessageEntity
+from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
@@ -19,9 +12,7 @@ from telegram.ext import (
     filters,
 )
 
-# Gemini SDK (OFFICIAL)
 from google import genai
-from google.genai import types
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -29,163 +20,170 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ------------ ENV VARS ------------
+# ENV
 TELEGRAM_TOKEN = "8380149688:AAHsvaAwE4S_6NxHu33gupBIvv2x-6i6JNw"
 GEMINI_API_KEY = os.getenv("API")
-MODEL = "gemini-2.5-flash"
+MODEL = "gemini-1.5-flash"
 
 if not TELEGRAM_TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN required")
+    raise RuntimeError("Missing TELEGRAM_TOKEN")
 if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY required")
+    raise RuntimeError("Missing GEMINI_API_KEY")
 
-# Gemini client
+# Gemini Client
 client = genai.Client(api_key=GEMINI_API_KEY)
 agen = client.aio
 
 LAST_RESPONSES = {}
 
-# ------------ HELPERS ------------
+
+# --- Helpers ---
 def mention_html(user):
     if user.username:
         return f"@{user.username}"
     return f"<a href='tg://user?id={user.id}'>{user.first_name}</a>"
 
-async def call_gemini(prompt: str):
+
+async def gemini_answer(prompt: str):
+    """Call Gemini API"""
     try:
         res = await agen.models.generate_content(
             model=MODEL,
             contents=prompt,
-            config=types.GenerateContentConfig(
-                max_output_tokens=500
-            )
         )
-        if hasattr(res, "text") and res.text:
+        if hasattr(res, "text"):
             return res.text.strip()
 
-        # fallback
-        parts = []
-        for p in getattr(res, "parts", []) or []:
-            if p.text:
-                parts.append(p.text)
-        return "\n".join(parts).strip()
+        return "\n".join([p.text for p in res.parts]).strip()
 
     except Exception as e:
-        logger.exception("Gemini error")
+        logger.error(e)
         return f"⚠️ Gemini Error: {e}"
 
-# ------------ THINKING + EDIT ANSWER ------------
-async def send_and_edit(chat_id, mention, prompt, context):
-    sent = await context.bot.send_message(chat_id, "thinking... 💭")
 
-    answer = await call_gemini(prompt)
+async def send_thinking_and_edit(chat_id, mention, prompt, ctx):
+    """Send thinking… message -> edit with Gemini answer"""
+    msg = await ctx.bot.send_message(chat_id, "thinking... 💭")
+
+    answer = await gemini_answer(prompt)
 
     if mention:
         answer = f"{mention}\n\n{answer}"
 
-    await context.bot.edit_message_text(
+    await ctx.bot.edit_message_text(
         chat_id=chat_id,
-        message_id=sent.message_id,
+        message_id=msg.message_id,
         text=answer,
-        parse_mode=ParseMode.HTML
+        parse_mode=ParseMode.HTML,
     )
 
     return answer
 
-# ------------ COMMAND HANDLERS ------------
+
+# --- Commands ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Hey! 😊\n"
-        "DM me anything & I’ll answer.\n"
-        "In groups, mention me to get a reply."
+        "👋 Hi! DM me anything.\n"
+        "In groups, mention me to get an answer."
     )
 
-# ------------ PRIVATE CHAT ------------
+
+# --- Private chat ---
 async def private_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
-    prompt = msg.text or ""
-    chat_id = msg.chat_id
+    text = msg.text or ""
 
-    LAST_RESPONSES[chat_id] = {"prompt": prompt}
+    LAST_RESPONSES[msg.chat_id] = {"prompt": text}
 
-    await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+    await context.bot.send_chat_action(msg.chat_id, ChatAction.TYPING)
 
-    await send_and_edit(chat_id, "", prompt, context)
+    await send_thinking_and_edit(msg.chat_id, "", text, context)
 
-# ------------ GROUP LOGIC ------------
+
+# --- Group logic ---
 async def group_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     text = msg.text or ""
-    chat_id = msg.chat_id
     bot_username = context.bot.username
+    chat_id = msg.chat_id
 
-    mention_found = False
+    mention = False
+
+    # Detect @botname mention
     if msg.entities:
         for e in msg.entities:
-            if e.type in [MessageEntity.MENTION, MessageEntity.TEXT_MENTION]:
-                ent = text[e.offset: e.offset + e.length]
-                if f"@{bot_username}" in ent:
-                    mention_found = True
+            if e.type == MessageEntity.MENTION:
+                part = text[e.offset: e.offset + e.length]
+                if part == f"@{bot_username}":
+                    mention = True
 
-    reply_to_bot = False
-    if msg.reply_to_message:
-        if msg.reply_to_message.from_user and msg.reply_to_message.from_user.is_bot:
-            reply_to_bot = True
+    # Detect replying to bot
+    reply_to_bot = (
+        msg.reply_to_message
+        and msg.reply_to_message.from_user
+        and msg.reply_to_message.from_user.is_bot
+    )
 
-    if not (mention_found or reply_to_bot):
-        return  # ignore normal group msgs
-
-    prompt = text.replace(f"@{bot_username}", "").strip()
-
-    # if user only tagged bot without text, use replied message text
-    if not prompt and msg.reply_to_message:
-        prompt = msg.reply_to_message.text or ""
-
-    if not prompt:
-        await msg.reply_text("Ask something 😄")
+    if not (mention or reply_to_bot):
         return
 
-    user_ment = mention_html(update.effective_user)
+    # Clean bot name from text
+    clean = text.replace(f"@{bot_username}", "").strip()
 
-    LAST_RESPONSES[chat_id] = {"prompt": prompt}
+    # If empty, take replied text
+    if not clean and msg.reply_to_message:
+        clean = msg.reply_to_message.text or ""
+
+    if not clean:
+        await msg.reply_text("Ask something 🙂")
+        return
+
+    m = mention_html(update.effective_user)
+
+    LAST_RESPONSES[chat_id] = {"prompt": clean}
 
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
 
-    await send_and_edit(chat_id, user_ment, prompt, context)
+    await send_thinking_and_edit(chat_id, m, clean, context)
 
-# ------------ REGENERATE BUTTON ------------
+
+# --- Callback (regen) ---
 async def regen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    chat_id = q.message.chat_id
 
+    chat_id = q.message.chat_id
     last = LAST_RESPONSES.get(chat_id)
+
     if not last:
-        await q.edit_message_text("No previous message!")
+        await q.edit_message_text("No previous prompt.")
         return
 
     prompt = last["prompt"]
-    user_mention = "" if q.message.chat.type == "private" else mention_html(q.from_user)
+    m = "" if q.message.chat.type == "private" else mention_html(q.from_user)
 
-    await send_and_edit(chat_id, user_mention, prompt, context)
+    await send_thinking_and_edit(chat_id, m, prompt, context)
 
-# ------------ ROUTER ------------
-async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+# --- Router ---
+async def msg_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == "private":
         await private_msg(update, context)
     else:
         await group_msg(update, context)
 
-# ------------ MAIN ------------
+
+# --- MAIN ---
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(regen, pattern="^regen$"))
-    app.add_handler(MessageHandler(filters.TEXT | filters.Caption, message_router))
+    app.add_handler(MessageHandler(filters.TEXT, msg_router))
 
     print("Bot running in polling mode…")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
