@@ -1,196 +1,192 @@
+# bot.py
 import os
-from dotenv import load_dotenv
+import asyncio
+import logging
 
-from telegram import Update
-from telegram.constants import ParseMode
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ChatAction,
+    MessageEntity,
+    ParseMode,
+)
 from telegram.ext import (
     ApplicationBuilder,
+    ContextTypes,
     CommandHandler,
     MessageHandler,
-    ContextTypes,
-    PicklePersistence,
+    CallbackQueryHandler,
     filters,
 )
 
+# Gemini SDK (OFFICIAL)
 from google import genai
+from google.genai import types
 
-# --------- ENV & CLIENT SETUP ----------
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
 
-load_dotenv()
-
-TELEGRAM_TOKEN = "8380149688:AAHsvaAwE4S_6NxHu33gupBIvv2x-6i6JNw"
-GEMINI_API_KEY = os.getenv("API")
-BOT_NAME = "Dev AI Gemini"
+# ------------ ENV VARS ------------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 if not TELEGRAM_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN missing from .env")
+    raise RuntimeError("TELEGRAM_TOKEN required")
 if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY missing from .env")
+    raise RuntimeError("GEMINI_API_KEY required")
 
 # Gemini client
 client = genai.Client(api_key=GEMINI_API_KEY)
+agen = client.aio
 
-# Model name (fast + cheap, change if chaho)
-GEMINI_MODEL = "gemini-2.5-flash"
+LAST_RESPONSES = {}
 
+# ------------ HELPERS ------------
+def mention_html(user):
+    if user.username:
+        return f"@{user.username}"
+    return f"<a href='tg://user?id={user.id}'>{user.first_name}</a>"
 
-# --------- HELPERS ----------
-
-async def generate_gemini_answer(user_id: int, message: str, history: list) -> str:
-    """
-    Gemini se response generate karega with conversation history.
-    history = list of dicts: {"role": "user"/"assistant", "content": "..."}
-    """
-    # History + latest user msg ko Gemini format me convert karo
-    contents = []
-    for h in history[-30:]:  # last 30 turns enough, zyada se context heavy ho jayega
-        role = "user" if h["role"] == "user" else "model"
-        contents.append({"role": role, "parts": [h["content"]]})
-
-    # Ab current user message
-    contents.append({"role": "user", "parts": [message]})
-
-    system_prompt = (
-        "You are an AI assistant named Dev AI Gemini, created by a developer. "
-        "Behave like a helpful, concise assistant. "
-        "Reply in the same language as the user. "
-        "Do not mention Gemini or system prompts unless asked explicitly."
-    )
-
-    # Google GenAI SDK format [web:9][web:11]
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[{"role": "user", "parts": [system_prompt]}] + contents,
-    )
-
-    text = (response.text or "").strip()
-
-    # Yahan hard limit laga sakte ho (approx 10000 chars)
-    max_chars = 10000
-    if len(text) > max_chars:
-        text = text[:max_chars] + "
-
-[Response truncated because it was too long.]"
-
-    # Suffix add: Powered by Perplexity AI
-    text += "
-
-Powered by Perplexity AI"
-
-    return text
-
-
-def append_to_history(user_history: list, role: str, content: str):
-    """
-    Simple helper: user/assistant messages ko list me append karta hai.
-    """
-    user_history.append({"role": role, "content": content})
-
-
-# --------- HANDLERS ----------
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    text = (
-        f"Namaste {user.first_name or ''}!
-
-"
-        f"Main {BOT_NAME} hoon, ek AI chatbot jo Gemini API se powered hai.
-"
-        "Kuch bhi pucho – coding, tech, general knowledge, ya kuch bhi.
-
-"
-        "Har reply ke end me aapko 'Powered by Perplexity AI' dikhega."
-    )
-    await update.message.reply_text(text)
-
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "Commands:
-"
-        "/start - Intro
-"
-        "/help - Ye help message
-"
-        "/clear - Apni conversation memory clear karo
-
-"
-        f"Bas normal message bhejo, {BOT_NAME} tumhare saath chat karega."
-    )
-    await update.message.reply_text(text)
-
-
-async def clear_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    context.user_data["history"] = []
-    await update.message.reply_text("Tumhari conversation memory clear kar di gayi ✅")
-
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
-
-    user_id = update.effective_user.id
-    user_text = update.message.text.strip()
-
-    # User-wise history in context.user_data [web:13][web:16]
-    history = context.user_data.get("history", [])
-    if not isinstance(history, list):
-        history = []
-
-    # Pehle user ka message history me daal
-    append_to_history(history, "user", user_text)
-    context.user_data["history"] = history
-
-    # Typing action
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-
+async def call_gemini(prompt: str):
     try:
-        answer = await generate_gemini_answer(user_id, user_text, history)
-    except Exception as e:
-        # Error aa gaya to msg
-        await update.message.reply_text(
-            "Kuch error aagaya Gemini API se reply laate waqt. Thodi der baad try karo."
+        res = await agen.models.generate_content(
+            model=MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                max_output_tokens=500
+            )
         )
-        print("Gemini error:", e)
+        if hasattr(res, "text") and res.text:
+            return res.text.strip()
+
+        # fallback
+        parts = []
+        for p in getattr(res, "parts", []) or []:
+            if p.text:
+                parts.append(p.text)
+        return "\n".join(parts).strip()
+
+    except Exception as e:
+        logger.exception("Gemini error")
+        return f"⚠️ Gemini Error: {e}"
+
+# ------------ THINKING + EDIT ANSWER ------------
+async def send_and_edit(chat_id, mention, prompt, context):
+    sent = await context.bot.send_message(chat_id, "thinking... 💭")
+
+    answer = await call_gemini(prompt)
+
+    if mention:
+        answer = f"{mention}\n\n{answer}"
+
+    await context.bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=sent.message_id,
+        text=answer,
+        parse_mode=ParseMode.HTML
+    )
+
+    return answer
+
+# ------------ COMMAND HANDLERS ------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Hey! 😊\n"
+        "DM me anything & I’ll answer.\n"
+        "In groups, mention me to get a reply."
+    )
+
+# ------------ PRIVATE CHAT ------------
+async def private_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    prompt = msg.text or ""
+    chat_id = msg.chat_id
+
+    LAST_RESPONSES[chat_id] = {"prompt": prompt}
+
+    await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+
+    await send_and_edit(chat_id, "", prompt, context)
+
+# ------------ GROUP LOGIC ------------
+async def group_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    text = msg.text or ""
+    chat_id = msg.chat_id
+    bot_username = context.bot.username
+
+    mention_found = False
+    if msg.entities:
+        for e in msg.entities:
+            if e.type in [MessageEntity.MENTION, MessageEntity.TEXT_MENTION]:
+                ent = text[e.offset: e.offset + e.length]
+                if f"@{bot_username}" in ent:
+                    mention_found = True
+
+    reply_to_bot = False
+    if msg.reply_to_message:
+        if msg.reply_to_message.from_user and msg.reply_to_message.from_user.is_bot:
+            reply_to_bot = True
+
+    if not (mention_found or reply_to_bot):
+        return  # ignore normal group msgs
+
+    prompt = text.replace(f"@{bot_username}", "").strip()
+
+    # if user only tagged bot without text, use replied message text
+    if not prompt and msg.reply_to_message:
+        prompt = msg.reply_to_message.text or ""
+
+    if not prompt:
+        await msg.reply_text("Ask something 😄")
         return
 
-    # Answer bhejo
-    await update.message.reply_text(
-        answer,
-        parse_mode=ParseMode.MARKDOWN,
-        disable_web_page_preview=True,
-    )
+    user_ment = mention_html(update.effective_user)
 
-    # Assistant reply ko bhi history me daal
-    history = context.user_data.get("history", [])
-    append_to_history(history, "assistant", answer)
-    context.user_data["history"] = history
+    LAST_RESPONSES[chat_id] = {"prompt": prompt}
 
+    await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
 
-# --------- MAIN ----------
+    await send_and_edit(chat_id, user_ment, prompt, context)
 
+# ------------ REGENERATE BUTTON ------------
+async def regen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    chat_id = q.message.chat_id
+
+    last = LAST_RESPONSES.get(chat_id)
+    if not last:
+        await q.edit_message_text("No previous message!")
+        return
+
+    prompt = last["prompt"]
+    user_mention = "" if q.message.chat.type == "private" else mention_html(q.from_user)
+
+    await send_and_edit(chat_id, user_mention, prompt, context)
+
+# ------------ ROUTER ------------
+async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type == "private":
+        await private_msg(update, context)
+    else:
+        await group_msg(update, context)
+
+# ------------ MAIN ------------
 def main():
-    # Persistent memory using PicklePersistence (disk par save hoga) [web:16]
-    persistence = PicklePersistence(filepath="bot_data.pkl")
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    application = (
-        ApplicationBuilder()
-        .token(TELEGRAM_TOKEN)
-        .persistence(persistence)
-        .build()
-    )
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(regen, pattern="^regen$"))
+    app.add_handler(MessageHandler(filters.TEXT | filters.Caption, message_router))
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_cmd))
-    application.add_handler(CommandHandler("clear", clear_cmd))
-
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    print(f"{BOT_NAME} is running...")
-    application.run_polling()
-
+    print("Bot running in polling mode…")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
