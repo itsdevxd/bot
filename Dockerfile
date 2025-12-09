@@ -6,7 +6,7 @@ ENV PYTHONUNBUFFERED=1
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc g++ make libffi-dev libssl-dev \
+    gcc g++ make libffi-dev libssl-dev tzdata \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
