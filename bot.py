@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # ENV
 TELEGRAM_TOKEN = "8380149688:AAHsvaAwE4S_6NxHu33gupBIvv2x-6i6JNw"
 GEMINI_API_KEY = os.getenv("API")
-MODEL = "gemini-1.5-flash"
+MODEL = "gemini-2.5-flash"
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("Missing TELEGRAM_TOKEN")
