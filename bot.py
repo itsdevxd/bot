@@ -1,4 +1,3 @@
-# bot.py
 import os
 import asyncio
 import logging
@@ -31,9 +30,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ------------ ENV VARS ------------
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+TELEGRAM_TOKEN = "8380149688:AAHsvaAwE4S_6NxHu33gupBIvv2x-6i6JNw"
+GEMINI_API_KEY = os.getenv("API")
+MODEL = "gemini-2.5-flash"
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN required")
